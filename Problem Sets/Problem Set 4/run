@@ -1,0 +1,2 @@
+#!/bin/bash
+./HW4 red_eye_effect_5.jpg red_eye_effect_template_5.jpg
