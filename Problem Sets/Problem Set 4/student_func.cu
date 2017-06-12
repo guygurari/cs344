@@ -46,24 +46,23 @@
 
 typedef unsigned int uint;
 
-#define BLOCK_WIDTH 256
+#define BLOCK_WIDTH 1024
 
 #define BITS_PER_DIGIT 4 // 16 possible values per digit
 #define VALUES_PER_DIGIT (1 << BITS_PER_DIGIT)
 #define DIGIT_MASK ((1 << BITS_PER_DIGIT) - 1)
 
-#define HISTOGRAM_ELEMS_PER_THREAD 255
-
-// Static variable doesn't work with cudaMemcpy... weird
-//__device__ uint d_digitOffsets[VALUES_PER_DIGIT];
+#define HISTOGRAM_ELEMS_PER_THREAD 1024
     
 // Compute a histogram of the number of occurences of every possible value
 // of the digit
-__global__ void histogramKernel(uint* const d_inputVals,
+__global__ void histogramKernel(const uint* const d_inputVals,
                                 const size_t numElems,
                                 const uint digit,
-                                uint* d_blockHistograms) {
-    extern __shared__ uint sharedHistograms[];
+                                uint* const d_threadHistograms,
+                                const uint numThreads) {
+
+    //extern __shared__ uint sharedHistograms[];
         
     const size_t absThreadIdx = blockIdx.x * blockDim.x + threadIdx.x;
     const uint digitShift = BITS_PER_DIGIT * digit;
@@ -87,31 +86,77 @@ __global__ void histogramKernel(uint* const d_inputVals,
         }
     }
 
-    // Write local histogram to shared mem
+    // Write local histogram to global mem
     for (int i = 0; i < VALUES_PER_DIGIT; i++) {
-        sharedHistograms[threadIdx.x * VALUES_PER_DIGIT + i] = localHistogram[i];
+        //sharedHistograms[threadIdx.x * VALUES_PER_DIGIT + i] = localHistogram[i];
+
+        // First write all the histograms of digitValue=0
+        // Then histograms of digitValue=1
+        // etc.
+        d_threadHistograms[i * numThreads + absThreadIdx] = localHistogram[i];
+    }
+}
+
+// Add-scan the given input with Hillis-Steele, then convert to exclusive scan.
+// Run in a single block so we can synchronize.
+__global__ void exclusiveScanKernel(uint* const d_input,
+                                    const uint len,
+                                    const uint numReduceThreads) {
+    // How many elements should this thread process
+    const uint lenToProcess =
+        len / numReduceThreads + (len % numReduceThreads == 0 ? 0 : 1);
+
+    /*if (threadIdx.x == 0) {
+        printf("len = %d\n", (int) len);
+        printf("numReduceThreads = %d\n", (int) numReduceThreads);
+        printf("lenToProcess = %d\n", (int) lenToProcess);
+        }*/
+
+    const uint threadOffset = threadIdx.x * lenToProcess;
+
+    const uint workspaceLen = 512;
+
+    if (workspaceLen < lenToProcess) {
+        printf("ERROR: Workspace isn't large enough!\n");
+        return;
     }
 
-    __syncthreads();
+    // Inclusive scan
+    for (int s = 1; s < len; s *= 2) {
+        uint values[workspaceLen];
+        
+        for (int i = threadOffset; i < threadOffset + lenToProcess; i++) {
+            if (i < len) {
+                values[i-threadOffset] = (i-s >= 0) ? d_input[i-s] : 0;
+            }
+        }
 
-    // Reduce shared histograms to a single one
-    // (Slow due to lots of branching, oh well)
-    for (int s = blockDim.x/2; s > 0; s /= 2) {
-        // TODO parallelize the for (i=...) loop
-        if (threadIdx.x < s) {
-            for (int i = 0; i < VALUES_PER_DIGIT; i++) {
-                sharedHistograms[threadIdx.x * VALUES_PER_DIGIT + i] +=
-                    sharedHistograms[(threadIdx.x+s) * VALUES_PER_DIGIT + i];
+        __syncthreads();
+
+        for (uint i = threadOffset; i < threadOffset + lenToProcess; i++) {
+            if (i < len) {
+                d_input[i] += values[i-threadOffset];
             }
         }
 
         __syncthreads();
     }
 
-    // Write block histogram to global memory
-    if (threadIdx.x < VALUES_PER_DIGIT) {
-        d_blockHistograms[blockIdx.x * VALUES_PER_DIGIT + threadIdx.x] = 
-            sharedHistograms[threadIdx.x];
+    // Turn into exclusive scan
+    uint values[workspaceLen];
+
+    for (int i = threadOffset; i < threadOffset + lenToProcess; i++) {
+        if (i < len) {
+            values[i-threadOffset] = (i-1 >= 0) ? d_input[i-1] : 0;
+        }
+    }
+
+    __syncthreads();
+
+    for (int i = threadOffset; i < threadOffset + lenToProcess; i++) {
+        if (i < len) {
+            d_input[i] = values[i-threadOffset];
+        }
     }
 }
 
@@ -153,31 +198,42 @@ void reference_histogram(uint* const d_inputVals,
     printf("\n");
 }
 
+// Write the elements of the subsequence to their proper output positions
+// as indicated by d_threadOffsets. Works on the same data subsets as 
+// histogramKernel.
 __global__ void rearrangeKernel(uint* const d_inputVals,
                                 uint* const d_inputPos,
                                 uint* const d_outputVals,
                                 uint* const d_outputPos,
                                 const size_t numElems,
-                                uint* const d_digitOffsets,
+                                const uint* const d_threadOffsets,
+                                const uint numThreads,
                                 const uint digit) {
-    uint targetDigitValue = threadIdx.x;
-    uint offset = d_digitOffsets[targetDigitValue];
 
-    for (size_t i = 0; i < numElems; i++) {
-        const uint digitShift = BITS_PER_DIGIT * digit;
-        const uint digitValue = (d_inputVals[i] >> digitShift) & DIGIT_MASK;
+    const size_t absThreadIdx = blockIdx.x * blockDim.x + threadIdx.x;
+    const uint digitShift = BITS_PER_DIGIT * digit;
 
-        if (digitValue == targetDigitValue) {
-            d_outputVals[offset] = d_inputVals[i];
-            d_outputPos[offset] = d_inputPos[i];
-            offset++;
-        }
+    // Read this thread's initial offsets (offset per digit value)
+    uint offsets[VALUES_PER_DIGIT];
+
+    for (uint i = 0; i < VALUES_PER_DIGIT; i++) {
+        offsets[i] = d_threadOffsets[i * numThreads + absThreadIdx];
     }
 
-    /*if (targetDigitValue < 6) {
-        printf("Thread %d final offset: %u vs. %u\n",
-               threadIdx.x, offset, d_digitOffsets[targetDigitValue+1]);
-               }*/
+    // Offset into the input array
+    const uint threadInputOffset = absThreadIdx * HISTOGRAM_ELEMS_PER_THREAD;
+
+    for (int i = threadInputOffset;
+         i < threadInputOffset + HISTOGRAM_ELEMS_PER_THREAD;
+         i++) {
+
+        if (i < numElems) {
+            uint digitValue = (d_inputVals[i] >> digitShift) & DIGIT_MASK;
+            d_outputVals[offsets[digitValue]] = d_inputVals[i];
+            d_outputPos[offsets[digitValue]] = d_inputPos[i];
+            offsets[digitValue]++;
+        }
+    }
 }
 
 void radix_sort_pass(uint* const d_inputVals,
@@ -186,65 +242,52 @@ void radix_sort_pass(uint* const d_inputVals,
                      uint* const d_outputPos,
                      const size_t numElems,
                      uint digit,
-                     size_t numHistThreads,
                      size_t numHistBlocks,
-                     uint* d_blockHistograms,
-                     uint* h_blockHistograms,
-                     uint* d_digitOffsets) {
-    int sharedMemSize = sizeof(uint) * VALUES_PER_DIGIT * BLOCK_WIDTH;
+                     uint* d_threadHistograms) {
+    //int sharedMemSize = sizeof(uint) * VALUES_PER_DIGIT * BLOCK_WIDTH;
     //printf("Allocating %d bytes of shared memory\n", sharedMemSize);
 
-    histogramKernel<<<numHistBlocks, BLOCK_WIDTH, sharedMemSize>>>
-        (d_inputVals, numElems, digit, d_blockHistograms);
+    const uint numHistThreads = numHistBlocks * BLOCK_WIDTH;
+
+    //printf("Launching Histogram\n"); fflush(stdout);
+    histogramKernel<<<numHistBlocks, BLOCK_WIDTH>>>
+        (d_inputVals, numElems, digit, d_threadHistograms, numHistThreads);
 
     cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
-    const int blockHistSize = sizeof(uint) * VALUES_PER_DIGIT * numHistBlocks;
-    checkCudaErrors(cudaMemcpy(h_blockHistograms,
-                               d_blockHistograms,
-                               blockHistSize,
-                               cudaMemcpyDeviceToHost));
 
-    uint histogram[VALUES_PER_DIGIT];
-    memset(histogram, 0, sizeof(uint) * VALUES_PER_DIGIT);
+    //printf("Launching Scan\n"); fflush(stdout);
+    const int numReduceThreads = 1024;
+    exclusiveScanKernel<<<1, numReduceThreads>>>(d_threadHistograms,
+                                                 numHistThreads * VALUES_PER_DIGIT,
+                                                 numReduceThreads);
 
-    for (size_t i = 0; i < numHistBlocks; i++) {
-        for (size_t j = 0; j < VALUES_PER_DIGIT; j++) {
-            histogram[j] += h_blockHistograms[i * VALUES_PER_DIGIT + j];
-        }
-    }
+        
+    cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
 
-    /*int total = 0;
-    for (int i = 0; i < VALUES_PER_DIGIT; i++) {
-        printf("%02x : %d\n", i, histogram[i]);
-        total += histogram[i];
-    }
-    printf("Total: %d\n", total);
-    reference_histogram(d_inputVals, numElems, digit);*/
-
-    // Compute histogram prefix sum. It's a small histogram so we do it on the host.
-    uint h_digitOffsets[VALUES_PER_DIGIT];
-    h_digitOffsets[0] = 0;
-
-    for (int i = 1; i < VALUES_PER_DIGIT; i++) {
-        h_digitOffsets[i] = h_digitOffsets[i-1] + histogram[i-1];
-    }
-
-    checkCudaErrors(cudaMemcpy(d_digitOffsets,
-                               h_digitOffsets,
-                               sizeof(uint) * VALUES_PER_DIGIT,
-                               cudaMemcpyHostToDevice));
+    const uint* const d_threadOffsets = d_threadHistograms;
 
     // Rearrange values according to offsets
-    rearrangeKernel<<<1, VALUES_PER_DIGIT>>>(d_inputVals,
-                                             d_inputPos,
-                                             d_outputVals,
-                                             d_outputPos,
-                                             numElems,
-                                             d_digitOffsets,
-                                             digit);
+    rearrangeKernel<<<numHistBlocks, BLOCK_WIDTH>>>(d_inputVals,
+                                                    d_inputPos,
+                                                    d_outputVals,
+                                                    d_outputPos,
+                                                    numElems,
+                                                    d_threadOffsets,
+                                                    numHistThreads,
+                                                    digit);
+
     cudaDeviceSynchronize(); checkCudaErrors(cudaGetLastError());
 }
 
+/*
+ * This implementation is very slow. The last rearrangement step has one thread
+ * pre digit value, and each thread has to loop over the whole input.
+ * We can parallelize as follows: instead of computing one big histogram for the
+ * whole input, we should keep the histograms for each subsequence. So we have a 2D
+ * array of histograms: per digit value and per subsequence. Then the offsets (the
+ * prefix sums) should again be computed per subsequence. So each subsequence knows
+ * when all the previous subsequences ended, and can output its elements independently.
+ */
 void your_sort(uint* const d_inputVals,
                uint* const d_inputPos,
                uint* const d_outputVals,
@@ -255,20 +298,16 @@ void your_sort(uint* const d_inputVals,
 
     size_t numHistThreads = get_enough_processors(numElems, HISTOGRAM_ELEMS_PER_THREAD);
     size_t numHistBlocks = get_enough_processors(numHistThreads, BLOCK_WIDTH);
+    numHistThreads = numHistBlocks * BLOCK_WIDTH;
 
     printf("Histogram: %d threads, %d blocks\n",
            (int) numHistThreads,
            (int) numHistBlocks);
 
-    uint* d_blockHistograms;
-    uint* h_blockHistograms;
-    const int blockHistSize = sizeof(uint) * VALUES_PER_DIGIT * numHistBlocks;
-    checkCudaErrors(cudaMalloc((void**) &d_blockHistograms, blockHistSize));
-    h_blockHistograms = (uint*) malloc(blockHistSize);
-
-    uint* d_digitOffsets;
-    checkCudaErrors(cudaMalloc((void**) &d_digitOffsets,
-                               sizeof(uint) * VALUES_PER_DIGIT));
+    uint* d_threadHistograms;
+    const int threadHistsSize = sizeof(uint) * VALUES_PER_DIGIT * numHistThreads;
+    printf("Allocating %d bytes of global memory\n", threadHistsSize);
+    checkCudaErrors(cudaMalloc((void**) &d_threadHistograms, threadHistsSize));
 
     assert(sizeof(uint) % BITS_PER_DIGIT == 0);
     uint maxDigit = sizeof(uint) * 8 / BITS_PER_DIGIT;
@@ -285,11 +324,8 @@ void your_sort(uint* const d_inputVals,
                         d_myOutputPos,
                         numElems,
                         digit,
-                        numHistThreads,
                         numHistBlocks,
-                        d_blockHistograms,
-                        h_blockHistograms,
-                        d_digitOffsets);
+                        d_threadHistograms);
 
         // Swap buffers
         if (digit < maxDigit - 1) {
@@ -335,7 +371,7 @@ void your_sort(uint* const d_inputVals,
     }
     printf(" ...\n");*/
 
-    checkCudaErrors(cudaFree(d_blockHistograms));
-    checkCudaErrors(cudaFree(d_digitOffsets));
-    free(h_blockHistograms);
+    checkCudaErrors(cudaFree(d_threadHistograms));
+    //checkCudaErrors(cudaFree(d_digitOffsets));
+    //free(h_blockHistograms);
 }
