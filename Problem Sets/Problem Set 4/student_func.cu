@@ -48,11 +48,12 @@ typedef unsigned int uint;
 
 #define BLOCK_WIDTH 1024
 
+// Numbers chosen by profiling
 #define BITS_PER_DIGIT 4 // 16 possible values per digit
 #define VALUES_PER_DIGIT (1 << BITS_PER_DIGIT)
 #define DIGIT_MASK ((1 << BITS_PER_DIGIT) - 1)
 
-#define HISTOGRAM_ELEMS_PER_THREAD 1024
+#define ELEMS_PER_THREAD 256
     
 // Compute a histogram of the number of occurences of every possible value
 // of the digit
@@ -75,9 +76,9 @@ __global__ void histogramKernel(const uint* const d_inputVals,
     }
 
     // Offset into the input array
-    const uint threadInputOffset = absThreadIdx * HISTOGRAM_ELEMS_PER_THREAD;
+    const uint threadInputOffset = absThreadIdx * ELEMS_PER_THREAD;
 
-    for (size_t i = 0; i < HISTOGRAM_ELEMS_PER_THREAD; i++) {
+    for (size_t i = 0; i < ELEMS_PER_THREAD; i++) {
         int inputOffset = threadInputOffset + i;
 
         if (inputOffset < numElems) {
@@ -105,12 +106,6 @@ __global__ void exclusiveScanKernel(uint* const d_input,
     // How many elements should this thread process
     const uint lenToProcess =
         len / numReduceThreads + (len % numReduceThreads == 0 ? 0 : 1);
-
-    /*if (threadIdx.x == 0) {
-        printf("len = %d\n", (int) len);
-        printf("numReduceThreads = %d\n", (int) numReduceThreads);
-        printf("lenToProcess = %d\n", (int) lenToProcess);
-        }*/
 
     const uint threadOffset = threadIdx.x * lenToProcess;
 
@@ -221,10 +216,10 @@ __global__ void rearrangeKernel(uint* const d_inputVals,
     }
 
     // Offset into the input array
-    const uint threadInputOffset = absThreadIdx * HISTOGRAM_ELEMS_PER_THREAD;
+    const uint threadInputOffset = absThreadIdx * ELEMS_PER_THREAD;
 
     for (int i = threadInputOffset;
-         i < threadInputOffset + HISTOGRAM_ELEMS_PER_THREAD;
+         i < threadInputOffset + ELEMS_PER_THREAD;
          i++) {
 
         if (i < numElems) {
@@ -296,7 +291,7 @@ void your_sort(uint* const d_inputVals,
 { 
     printf("numElems = %d\n", (int) numElems);
 
-    size_t numHistThreads = get_enough_processors(numElems, HISTOGRAM_ELEMS_PER_THREAD);
+    size_t numHistThreads = get_enough_processors(numElems, ELEMS_PER_THREAD);
     size_t numHistBlocks = get_enough_processors(numHistThreads, BLOCK_WIDTH);
     numHistThreads = numHistBlocks * BLOCK_WIDTH;
 
@@ -309,7 +304,7 @@ void your_sort(uint* const d_inputVals,
     printf("Allocating %d bytes of global memory\n", threadHistsSize);
     checkCudaErrors(cudaMalloc((void**) &d_threadHistograms, threadHistsSize));
 
-    assert(sizeof(uint) % BITS_PER_DIGIT == 0);
+    assert(sizeof(uint) * 8 % BITS_PER_DIGIT == 0);
     uint maxDigit = sizeof(uint) * 8 / BITS_PER_DIGIT;
 
     uint* d_myInputVals = d_inputVals;
@@ -353,25 +348,5 @@ void your_sort(uint* const d_inputVals,
     checkCudaErrors(cudaMemcpy(h_outputVals, d_outputVals, len, cudaMemcpyDeviceToHost));
     checkCudaErrors(cudaMemcpy(h_inputVals, d_inputVals, len, cudaMemcpyDeviceToHost));
 
-    /*printf("First few inputs:\n");
-    for (int i = 0; i < 5; i++) {
-        printf("%u\t", h_inputVals[i]);
-    }
-    printf(" ...\n");
-
-    printf("First few outputs:\n");
-    for (int i = 0; i < 5; i++) {
-        printf("%u\t", h_outputVals[i]);
-    }
-    printf(" ...\n");
-
-    printf("Last few outputs:\n");
-    for (int i = 0; i < 5; i++) {
-        printf("%u\t", h_outputVals[numElems - 1 - i]);
-    }
-    printf(" ...\n");*/
-
     checkCudaErrors(cudaFree(d_threadHistograms));
-    //checkCudaErrors(cudaFree(d_digitOffsets));
-    //free(h_blockHistograms);
 }
